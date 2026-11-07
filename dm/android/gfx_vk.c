@@ -724,6 +724,11 @@ static void reg_tex(int id, const tex_t *t, const view_t *v); static void reg_sa
 void mtl_reg_tex(int id, const tex_t *t, const view_t *vw) { reg_tex(id, t, vw); }
 void mtl_reg_samp(int id, const samp_par *p) { reg_samp(id, p); }
 void mtl_prog_release(prog_t *p) { (void)p; }
+// A finalized program leaves the bound state (hle_nvn.c ProgramFinalize, submission lock held; replay takes g_bk inside it): NVN reads a program only while it is bound, so a game may
+// finalize one that is still bound and reuse its memory, and the next draw would build its pipeline from that memory (nvn_mtl.m mtl_prog_forget). Pipeline keys are
+// built from D.bst per draw, so clearing the pointers is all a later draw needs
+static void prog_forget_bound(const prog_t *p);   // gfx_vk_draw.inc
+void mtl_prog_forget(const prog_t *p) { pthread_mutex_lock(&g_bk); prog_forget_bound(p); pthread_mutex_unlock(&g_bk); }
 void mtl_set_tex_pool_n(int n) { (void)n; }
 
 // ---------------- Copies ----------------
@@ -912,6 +917,7 @@ static void clear_tex(const p_clear_tex *ct) {
 
 static int png_texels(const char *path, VkFormat f, int bpp, const uint8_t *p, uint32_t w, uint32_t x, uint32_t y, uint32_t cw, uint32_t ch, int flip);   // below (the pass dump's PNGs)
 #include "gfx_vk_draw.inc"
+#include "gfx_iface_upstream.inc"
 
 // ---------------- Submission ----------------
 static void post(post_op o) {   // done when the current chunk completes, after its write-backs

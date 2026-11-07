@@ -219,6 +219,79 @@ void dispatch_release(void *o) {
     pthread_mutex_destroy(&s->m); pthread_cond_destroy(&s->c); free(s);
 }
 
+// ---- dispatch: queues (compat/dispatch/dispatch.h) ----
+typedef struct dm_dq_item { struct dm_dq_item *next; dispatch_function_t work; void *ctx; } dm_dq_item;
+struct dm_dispatch_queue {
+    int serial; qos_class_t qos; char label[64];
+    pthread_mutex_t m; pthread_cond_t c; dm_dq_item *head, *tail; int started;   // serial queues: the FIFO and its worker
+};
+static struct dm_dispatch_queue g_global_q[6] = {
+    {0, QOS_CLASS_USER_INTERACTIVE, "global.user-interactive"}, {0, QOS_CLASS_USER_INITIATED, "global.user-initiated"}, {0, QOS_CLASS_DEFAULT, "global.default"},
+    {0, QOS_CLASS_UTILITY, "global.utility"}, {0, QOS_CLASS_BACKGROUND, "global.background"}, {0, QOS_CLASS_UNSPECIFIED, "global.unspecified"}};
+dispatch_queue_t dispatch_get_global_queue(long identifier, unsigned long flags) {
+    (void)flags;
+    for (unsigned i = 0; i < sizeof g_global_q / sizeof *g_global_q; i++) if ((long)g_global_q[i].qos == identifier) return &g_global_q[i];
+    // Darwin's older priority constants (DISPATCH_QUEUE_PRIORITY_HIGH 2, DEFAULT 0, LOW -2, BACKGROUND INT16_MIN)
+    return identifier >= 2 ? &g_global_q[1] : identifier == 0 ? &g_global_q[2] : identifier >= -2 ? &g_global_q[3] : &g_global_q[4];
+}
+dispatch_queue_t dispatch_queue_create(const char *label, dispatch_queue_attr_t attr) {
+    (void)attr;   // DISPATCH_QUEUE_SERIAL is the only attribute the host passes
+    struct dm_dispatch_queue *q = calloc(1, sizeof *q); if (!q) die("dispatch_queue_create: out of memory");
+    q->serial = 1; q->qos = QOS_CLASS_DEFAULT; snprintf(q->label, sizeof q->label, "%s", label ? label : "");
+    pthread_mutex_init(&q->m, NULL); pthread_cond_init(&q->c, NULL);
+    return q;
+}
+static void *dm_dq_worker(void *p) {
+    struct dm_dispatch_queue *q = p;
+    { char n[16]; snprintf(n, sizeof n, "dq.%.12s", q->label)   /* thread names hold 15 characters */; pthread_setname_np(pthread_self(), n); }
+    for (;;) {
+        pthread_mutex_lock(&q->m);
+        while (!q->head) pthread_cond_wait(&q->c, &q->m);
+        dm_dq_item *it = q->head; q->head = it->next; if (!q->head) q->tail = NULL;
+        pthread_mutex_unlock(&q->m);
+        it->work(it->ctx); free(it);
+    }
+    return NULL;
+}
+typedef struct { dispatch_function_t work; void *ctx; qos_class_t qos; } dm_async_item;
+static void *dm_async_run(void *p) {
+    dm_async_item it = *(dm_async_item *)p; free(p);
+    setpriority(PRIO_PROCESS, (id_t)gettid(), dm_qos_nice(it.qos));
+    it.work(it.ctx); return NULL;
+}
+void dispatch_async_f(dispatch_queue_t q, void *context, dispatch_function_t work) {
+    if (q->serial) {
+        dm_dq_item *it = malloc(sizeof *it); if (!it) die("dispatch_async_f: out of memory");
+        it->next = NULL; it->work = work; it->ctx = context;
+        pthread_mutex_lock(&q->m);
+        if (q->tail) q->tail->next = it; else q->head = it;
+        q->tail = it;
+        if (!q->started) {
+            pthread_t th; int e = pthread_create(&th, NULL, dm_dq_worker, q);
+            if (e) die("dispatch queue %s: no worker thread (error %d)", q->label, e);
+            pthread_detach(th); q->started = 1;
+        }
+        pthread_cond_signal(&q->c);
+        pthread_mutex_unlock(&q->m);
+        return;
+    }
+    dm_async_item *it = malloc(sizeof *it); if (!it) die("dispatch_async_f: out of memory");
+    it->work = work; it->ctx = context; it->qos = q->qos;
+    pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    pthread_t th; int e = pthread_create(&th, &a, dm_async_run, it); pthread_attr_destroy(&a);
+    if (e) { LOG("[RED] dispatch_async_f: no thread (error %d): the work runs on the caller's thread", e); free(it); work(context); }
+}
+typedef struct { dispatch_function_t work; void *ctx; dispatch_semaphore_t done; } dm_sync_item;
+static void dm_sync_run(void *p) { dm_sync_item *s = p; s->work(s->ctx); dispatch_semaphore_signal(s->done); }
+void dispatch_sync_f(dispatch_queue_t q, void *context, dispatch_function_t work) {
+    if (!q->serial) { work(context); return; }   // a concurrent queue runs it at once, here on the caller's thread as libdispatch does
+    dm_sync_item s = {work, context, dispatch_semaphore_create(0)};
+    if (!s.done) die("dispatch_sync_f: out of memory");
+    dispatch_async_f(q, &s, dm_sync_run);
+    dispatch_semaphore_wait(s.done, DISPATCH_TIME_FOREVER);
+    dispatch_release(s.done);
+}
+
 // ---- SHA-256 (FIPS 180-4) ----
 static const uint32_t K256[64] = {
     0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,

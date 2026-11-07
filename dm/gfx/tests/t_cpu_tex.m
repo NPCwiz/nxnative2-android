@@ -10,7 +10,7 @@
 uint64_t g_t0_ns;
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
-module_t g_mod[MAX_MOD]; int g_nmod;
+module_t *g_mod; int g_nmod;
 void svc_thread_dump(void) {}
 uint64_t now_ns(void) { return bp_now(); }
 static int checks, failed;
@@ -38,6 +38,20 @@ static void retired_classification(void) {
     mtl_alias_drop_pool(&pools[1]);
     CHECK(!tex_cpu_written(b.serial) && !tex_cpu_written(late.serial) && !g_cpu_tex_retired.n, "pool cleanup removes all retired classifications");
 }
+static void descriptor_replacement(void) {
+    tex_t a = {.serial=nvn_new_serial()}, b = {.serial=nvn_new_serial()};
+    mtl_tex_init(&a); mtl_tex_init(&b);
+    mtl_reg_tex(1,&a,NULL); mtl_reg_tex(2,&a,NULL); mtl_reg_tex(3,&a,NULL);
+    mtl_reg_tex(2,&b,NULL); mtl_reg_tex(3,NULL,NULL);
+    mtl_tex_release(&a);
+    CHECK(g_treg[1].retired && !g_treg[2].retired && !g_treg[3].ok, "replacing middle and head descriptors preserves serial ownership");
+    mtl_reg_tex(1,&b,NULL); mtl_reg_tex(2,NULL,NULL);
+    CHECK(!nvn_hm_get(&g_treg_serial,&a.serial), "replacing the last descriptor removes the old serial");
+    mtl_tex_release(&b);
+    CHECK(g_treg[1].retired, "the replacement texture retires its current descriptors");
+    mtl_reg_tex(1,NULL,NULL);
+    CHECK(!g_treg_serial.n, "clearing descriptors removes serial links");
+}
 static void finalized_upload(int write_after_record) {
     const size_t len = 262144;
     uint8_t *mem = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
@@ -58,8 +72,17 @@ static void finalized_upload(int write_after_record) {
     h_nvnCommandBufferCopyTextureToBuffer(&cmd, &tex, NULL, &region, (uint64_t)mem+131072, 0);
     NVNcommandHandle handle = h_nvnCommandBufferEndRecording(&cmd);
     if (write_after_record) h_nvnTextureWriteTexels(&tex, NULL, &region, pixels);
+    // Cached descriptor views must not own every upload after its API object
+    // is finalized. Two IDs and a compatible view exercise all lookup caches.
+    mtl_reg_tex(2, (const tex_t *)&tex, NULL);
+    mtl_sub_begin();
+    id<MTLTexture> before = tex_by_id(1), second = tex_by_id(2); uint64_t compatible_id = 0;
+    CHECK(before && second && g_treg[1].view && g_treg[2].view, "live descriptors cache their texture");
+    CHECK(tex_fit(2, second, MTLTextureType2DArray, &compatible_id) && g_treg[2].alt, "live descriptor caches a compatible view");
+    CHECK(mtl_wait(mtl_sub_commit(),5000000000ull), "initial descriptor uploads completed");
     h_nvnTextureFinalize(&tex);
     CHECK(mtl_cpu_tex_count() == 0, "finalized texture leaves the live CPU set");
+    CHECK(!g_treg[1].view && !g_treg[2].view && !g_treg[2].alt, "finalization retires every descriptor's cached views");
     // Reuse the API object: commands and registered descriptors must use their snapshots.
     memset(&tex, 0xa5, sizeof tex);
     state_reset(); memset(&R,0,sizeof R); mtl_sub_begin(); mtl_exec((const uint8_t *)handle);
@@ -68,14 +91,54 @@ static void finalized_upload(int write_after_record) {
     CHECK(!memcmp(mem+131072, pixels, sizeof pixels), "finalized command snapshot uploads CPU-written pixels");
     mtl_sub_begin(); id<MTLTexture> registered = tex_by_id(1);
     CHECK(registered && registered.width == 4, "finalized registered descriptor resolves a Metal texture");
+    CHECK(tex_fit(2, tex_by_id(2), MTLTextureType2DArray, &compatible_id), "late compatible view resolves");
     CHECK(mtl_wait(mtl_sub_commit(),5000000000ull), "registered descriptor upload completed");
+    CHECK(!g_treg[1].view && !g_treg[2].view && !g_treg[2].alt, "late descriptor views retire at submission end");
     // Resolve again: a retired serial may already hold an NvPkg in the ghost cache.
     mtl_sub_begin(); mtl_exec((const uint8_t *)handle);
     CHECK(mtl_wait(mtl_sub_commit(),5000000000ull), "recorded snapshot can be replayed again");
     CHECK(!memcmp(mem+131072, pixels, sizeof pixels), "replayed retired snapshot keeps its CPU content");
-    mtl_reg_tex(1,NULL,NULL); h_nvnCommandBufferFinalize(&cmd);
+    mtl_reg_tex(1,NULL,NULL); mtl_reg_tex(2,NULL,NULL); h_nvnCommandBufferFinalize(&cmd);
     h_nvnMemoryPoolFinalize((NVNmemoryPool *)&pool);
     CHECK(!tex_cpu_written(serial), "pool finalization drops retired CPU classification");
+    defer_drain(); munmap(mem,len);
+}
+// nvnMemoryPoolFinalize on a game thread while the submit thread walks the texture IDs (pool_gpu, holding g_rmu): the finalize dropped the pool's CPU-written classification before it
+// marked the pool's IDs gone, so a walk in between found a live ID, a pool still set and a texture no longer CPU-written, and tex_mtl_ handed out its packaged entry (an NvPkg) as the
+// texture: "-[NvPkg buffer]: unrecognized selector" in tex_by_id (Ocarina of Time, reference/nvn-objects.md). Here the test holds g_rmu as the walk does while another thread finalizes
+static void *finalize_pool(void *pool) { h_nvnMemoryPoolFinalize((NVNmemoryPool *)pool); return NULL; }
+static void finalize_during_walk(void) {
+    const size_t len = 262144;
+    uint8_t *mem = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (mem == MAP_FAILED) abort();
+    pool_t pool = {0}; pool_builder_t pb = {.mem=mem, .size=len, .flags=NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    CHECK(h_nvnMemoryPoolInitialize((NVNmemoryPool *)&pool, (const NVNmemoryPoolBuilder *)&pb), "CPU-cached pool initialized");
+    NVNtextureBuilder tb; NVNtexture tex = {0}; h_nvnTextureBuilderSetDefaults(&tb);
+    h_nvnTextureBuilderSetWidth(&tb, 4); h_nvnTextureBuilderSetHeight(&tb, 4); h_nvnTextureBuilderSetFormat(&tb, NVN_FORMAT_RGBA8);
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, 65536);
+    CHECK(h_nvnTextureInitialize(&tex, &tb), "texture initialized");
+    uint64_t serial = ((tex_t *)&tex)->serial;
+    uint8_t pixels[64]; for (int i=0;i<64;i++) pixels[i]=(uint8_t)(i+32);
+    NVNcopyRegion region = {0,0,0,4,4,1};
+    h_nvnTextureWriteTexels(&tex, NULL, &region, pixels);
+    mtl_reg_tex(1, (const tex_t *)&tex, NULL);
+    mtl_sub_begin();
+    os_unfair_lock_lock(&g_rmu);
+    id<MTLTexture> first = tex_by_id(1);
+    CHECK(first && first.width == 4, "the packaged texture resolves");
+    CHECK([tex_get(serial) isKindOfClass:[NvPkg class]], "its table entry is an NvPkg");
+    pthread_t th; pthread_create(&th, NULL, finalize_pool, &pool);
+    usleep(100000);   // the finalize runs as far as it can while the walk holds g_rmu
+    CHECK(tex_cpu_written(serial), "the pool's classification stays while a walk can still find its IDs live");
+    id again = tex_mtl((const tex_t *)&tex);
+    CHECK(again && ![again isKindOfClass:[NvPkg class]], "tex_mtl does not hand out the NvPkg during the finalize");
+    os_unfair_lock_unlock(&g_rmu);
+    pthread_join(th, NULL);
+    CHECK(!tex_cpu_written(serial) && g_treg[1].gone, "after the finalize the ID is gone and the classification dropped");
+    os_unfair_lock_lock(&g_rmu); id after = tex_by_id(1); os_unfair_lock_unlock(&g_rmu);
+    CHECK(![after isKindOfClass:[NvPkg class]], "the gone ID does not hand out the NvPkg either");
+    CHECK(mtl_wait(mtl_sub_commit(),5000000000ull), "submission completed");
+    mtl_reg_tex(1,NULL,NULL); h_nvnTextureFinalize(&tex);
     defer_drain(); munmap(mem,len);
 }
 int main(int argc, const char **argv) { @autoreleasepool {
@@ -102,7 +165,16 @@ int main(int argc, const char **argv) { @autoreleasepool {
     tex_t z = {0}; mtl_tex_cpu_written(&z);
     CHECK(mtl_cpu_tex_count() == N - 2, "a texture with no serial is not recorded");
     for (int i=0;i<N;i++) mtl_tex_release(&t[i]);
-    retired_classification();
-    if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); }
+    // NVNtexture is plain data: finalizing a copy ends the copy. The texture stays live while the object it was initialized in holds it; if that object no longer does, the copy was the last one
+    static tex_t own, cpy, moved;
+    own.magic = MAGIC('T', 'E', 'X', 0); own.serial = 900001; own.d = t[0].d; mtl_tex_init(&own); mtl_tex_cpu_written(&own);
+    cpy = own; mtl_tex_release(&cpy);
+    CHECK(tex_cpu_written(own.serial) == 1, "finalizing a copy leaves the texture live");
+    mtl_tex_release(&own);
+    CHECK(!nvn_hm_get(&g_tex_live, &own.serial), "finalizing the object itself ends it");
+    own.serial = 900002; mtl_tex_init(&own); moved = own; own.magic = 0; mtl_tex_release(&moved);
+    CHECK(!nvn_hm_get(&g_tex_live, &moved.serial), "a copy outliving the object it was initialized in ends the texture");
+    retired_classification(); descriptor_replacement();
+    if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); finalize_during_walk(); }
     printf("t_cpu_tex: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

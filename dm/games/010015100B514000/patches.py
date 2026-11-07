@@ -25,3 +25,9 @@ def frame_step(ctx):
 
 
 FRAME_STEP = {'ff773e90972d544eb79406eaa65396d5': frame_step}
+
+BINDING = [
+    {'what': 'render scale x the 3D view dynamic-resolution factor (sead::FrameBuffer sizing)', 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "the game's own frame-buffer sizing at a fixed address of 1.2.1; the frame-step state page it reads is general",
+     'blocked': 'frame-step stubs have no function-matched form yet'},
+]
