@@ -63,8 +63,9 @@ Levels as defined in the task: *implemented* (source changed), *build-verified* 
 | `mavc_bt709`: 4 cases | as specified | runtime-verified (unit) |
 | Python: `compileall`, ruff with the repository's rules | no errors; ruff findings identical to `main`'s, one fewer | build-verified |
 | Python tests, `dm/tools/tests` + `dm/android/tests` (Linux) | 1,033 pass, 111 fail, 94 skip. Compared test by test with pristine upstream on the same machine: every failure also fails on upstream (macOS tools such as `cp -X`, Xcode, Oodle) except 3, which this branch fixed (`BINDING`, env switches, patch index). Android tests: 11 pass, 3 skip, 0 fail | runtime-verified (tests) |
-| Android NDK build, APK, install, launch | **not done**: the NDK could not be downloaded in the environment used (dl.google.com is not reachable from it) | — |
-| Original Switch games on an Android device | **not done**: no device or game files in the environment | — |
+| Android NDK build, APK, install, launch | done by the repository owner on their own machine and phone (2026-11-06); device and build log not recorded here yet | build-verified |
+| Launcher *Self test* on the phone: the synthetic module through the rewritten x18 slots, TLS, the SVC gate (upstream's new per-thread gate stubs) and a second guest thread | **passed** (reported by the repository owner, 2026-11-06) | runtime-verified |
+| Original Switch games on an Android device | **not done** | — |
 
 Nothing on this branch is gameplay-verified.
 
@@ -72,8 +73,8 @@ Nothing on this branch is gameplay-verified.
 
 In order:
 
-1. Build the APK with the NDK (`docs/BUILD_AND_TEST.md`) and fix what the 4 NDK-header files or the linker report.
-2. Run the self test on a phone (the launcher's *Self test*, `DM_FORCE_SELFTEST`): the synthetic module exercises x18 slots, TLS, the SVC gate (now the per-thread gate stubs) and a second guest thread.
+1. ~~Build the APK with the NDK~~ and ~~run the self test on a phone~~: done, passed (2026-11-06).
+2. Record the device (model, GPU, Android version) and the self test's log lines.
 3. Regression-test the four games in `docs/ANDROID_COMPATIBILITY.md`.
 4. Per-queue bound state in the Vulkan replay (`mtl_queue_activate`), which upstream added for games that submit on two queues.
 5. The Switch 2 work in `docs/ANDROID_SWITCH2_IMPLEMENTATION.md`.

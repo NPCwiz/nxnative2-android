@@ -4,7 +4,8 @@ What has been tested on Android, on which build, and how far. Levels: **build** 
 
 ## After the November 2026 upstream sync (branch `sync/upstream-5636e7a`)
 
-Nothing has been tested on a phone yet: the sync was done where neither the NDK nor a device was available. Every game below needs re-testing on this branch before the branch is merged. See [UPSTREAM_SYNC_STATUS.md](UPSTREAM_SYNC_STATUS.md) for what was verified instead.
+- **Self test: passed** on the repository owner's phone (2026-11-06, runtime level): the host built with the NDK, and the synthetic module ran through the rewritten x18 thread slots, TLS, the per-thread SVC gate stubs and a second guest thread.
+- **Games: not tested yet.** Every game below needs re-testing on this branch before the branch is merged. See [UPSTREAM_SYNC_STATUS.md](UPSTREAM_SYNC_STATUS.md) for what was verified instead.
 
 ## Regression targets
 
