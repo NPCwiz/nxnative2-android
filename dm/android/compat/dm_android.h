@@ -55,6 +55,7 @@ typedef int *thread_state_t, *thread_info_t, *vm_region_info_t;
 #define VM_FLAGS_FIXED 0
 #define VM_FLAGS_OVERWRITE 0x4000
 #define VM_INHERIT_NONE 2
+#define VM_INHERIT_SHARE 0
 static inline mach_port_t mach_task_self(void) { return 0; }
 static inline mach_port_t mach_thread_self(void) { return (mach_port_t)gettid(); }
 static inline kern_return_t mach_port_deallocate(mach_port_t t, mach_port_t p) { (void)t; (void)p; return KERN_SUCCESS; }
@@ -66,6 +67,13 @@ static inline kern_return_t vm_read_overwrite(mach_port_t task, vm_address_t add
     if (n < 0) { if (out) *out = 0; return KERN_FAILURE; }
     if (out) *out = (vm_size_t)n;
     return (vm_size_t)n == size ? KERN_SUCCESS : KERN_FAILURE;
+}
+// A write that fails instead of faulting (hle_cheats.c guest_page_write): process_vm_writev on our own process returns EFAULT for a range that is not mapped writable
+static inline kern_return_t vm_write(mach_port_t task, vm_address_t addr, vm_offset_t data, mach_msg_type_number_t size) {
+    (void)task;
+    struct iovec l = {(void *)data, size}, r = {(void *)addr, size};
+    ssize_t n = process_vm_writev(getpid(), &l, 1, &r, 1, 0);
+    return n == (ssize_t)size ? KERN_SUCCESS : KERN_FAILURE;
 }
 static inline kern_return_t vm_allocate(mach_port_t task, vm_address_t *addr, vm_size_t size, int flags) {
     (void)task; (void)flags;
@@ -98,6 +106,9 @@ typedef struct { struct { int seconds, microseconds; } user_time, system_time; i
 kern_return_t thread_info(mach_port_t t, int flavor, thread_info_t out, mach_msg_type_number_t *n);   // plat_android.c
 static inline kern_return_t mach_vm_remap(mach_port_t t, mach_vm_address_t *a, mach_vm_size_t s, mach_vm_size_t m, int f, mach_port_t st, mach_vm_address_t sa, boolean_t c, vm_prot_t *cur, vm_prot_t *max, vm_inherit_t i) {
     (void)t; (void)a; (void)s; (void)m; (void)f; (void)st; (void)sa; (void)c; (void)cur; (void)max; (void)i; return KERN_FAILURE; }
+static inline kern_return_t mach_vm_protect(mach_port_t t, mach_vm_address_t a, mach_vm_size_t s, boolean_t set_max, vm_prot_t p) {
+    (void)t; (void)set_max; return mprotect((void *)a, s, (p & VM_PROT_READ ? PROT_READ : 0) | (p & VM_PROT_WRITE ? PROT_WRITE : 0) | (p & VM_PROT_EXECUTE ? PROT_EXEC : 0)) ? KERN_FAILURE : KERN_SUCCESS; }
+static inline kern_return_t mach_vm_deallocate(mach_port_t t, mach_vm_address_t a, mach_vm_size_t s) { (void)t; return munmap((void *)a, s) ? KERN_FAILURE : KERN_SUCCESS; }
 // Task info: TASK_VM_INFO's footprint is the resident set (/proc/self/statm); the power counters Darwin keeps per task have no Android source
 typedef int *task_info_t;
 #define TASK_VM_INFO 22
@@ -152,6 +163,15 @@ static inline uint64_t clock_gettime_nsec_np(clockid_t c) { struct timespec ts; 
 static inline void sys_icache_invalidate(void *p, size_t n) { __builtin___clear_cache((char *)p, (char *)p + n); }
 static inline void sys_dcache_flush(void *p, size_t n) { (void)p; (void)n; }
 
+// ---- Code memory made at run time (hle_jit.c) ----
+// Darwin's MAP_JIT mapping is writable or executable per thread (pthread_jit_write_protect_np). Linux has no such switch: an anonymous PROT_READ | PROT_WRITE | PROT_EXEC
+// mapping is writable and executable on every thread at once (the app's SELinux domain allows it, as for the loader's own executable anonymous mappings). The flag is
+// then nothing and the switch a no-op; the instruction cache is still invalidated after each GenerateCode (sys_icache_invalidate above)
+#ifndef MAP_JIT
+#define MAP_JIT 0
+#endif
+static inline void pthread_jit_write_protect_np(int enabled) { (void)enabled; }
+
 // ---- Thread quality of service: mapped to nice values (setpriority on the thread id) ----
 typedef enum { QOS_CLASS_USER_INTERACTIVE = 0x21, QOS_CLASS_USER_INITIATED = 0x19, QOS_CLASS_DEFAULT = 0x15, QOS_CLASS_UTILITY = 0x11,
                QOS_CLASS_BACKGROUND = 0x09, QOS_CLASS_UNSPECIFIED = 0 } qos_class_t;
@@ -192,6 +212,26 @@ static inline void malloc_zone_free(malloc_zone_t *z, void *p) { (void)z; free(p
 
 // ---- Random ----
 #include <stdlib.h>   // bionic has arc4random / arc4random_buf
+
+// ---- BSD sorting ----
+// mergesort(3): BSD libc's stable sort, which bionic does not have (hle_hid.c sorts DM_KEYS steps with it and relies on equal times keeping their listed order).
+// A top-down merge sort over a scratch copy: stable, O(n log n), returns -1 with errno set when the scratch buffer cannot be had, as BSD's does
+static inline int mergesort(void *base, size_t n, size_t sz, int (*cmp)(const void *, const void *)) {
+    if (n < 2) return 0;
+    if (!sz) { errno = EINVAL; return -1; }
+    unsigned char *a = base, *tmp = malloc(n * sz);
+    if (!tmp) { errno = ENOMEM; return -1; }
+    for (size_t w = 1; w < n; w *= 2)   // bottom-up: runs of w merged into runs of 2w
+        for (size_t lo = 0; lo < n - w; lo += 2 * w) {
+            size_t mid = lo + w, hi = lo + 2 * w < n ? lo + 2 * w : n, i = lo, j = mid, k = 0;
+            while (i < mid && j < hi) { if (cmp(a + j * sz, a + i * sz) < 0) memcpy(tmp + k++ * sz, a + j++ * sz, sz); else memcpy(tmp + k++ * sz, a + i++ * sz, sz); }   // ties take the left run first
+            while (i < mid) memcpy(tmp + k++ * sz, a + i++ * sz, sz);
+            while (j < hi) memcpy(tmp + k++ * sz, a + j++ * sz, sz);
+            memcpy(a + lo * sz, tmp, k * sz);
+        }
+    free(tmp);
+    return 0;
+}
 
 // ---- Signal context ----
 // Darwin's thread state {x0-x28, fp, lr, sp, pc, cpsr} has the layout of Linux's sigcontext from regs[0] on {regs[0-30], sp, pc, pstate}, so the

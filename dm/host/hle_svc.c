@@ -3,6 +3,9 @@
 #include "dm.h"
 #include <sys/mman.h>
 #include <sys/mount.h>
+#ifdef __ANDROID__
+#include <sys/vfs.h>   // statfs / fstatfs: Linux keeps them here, without Darwin's f_fstypename and f_flags
+#endif
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <errno.h>
@@ -71,7 +74,9 @@ static size_t env_size(const char *name, size_t min, size_t align) {
 // written out while it is locked), sized or mapped; and a disk with less free space than DM_GUEST_FILE_MIN_FREE (default 5G), on the Mac that and 8 GB, as it can swap instead. A file is unlinked before
 // it is sized, so one left behind holds nothing. guest_file_thread stops the game when the disk falls under the minimum later. What the game gives back only goes PROT_NONE in the files (guest_release)
 // and reads 0 when it is opened again (alias_initialize, SetHeapSize)
+#ifndef __ANDROID__
 int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc.h, which the iOS SDK does not have
+#endif
 #define GF_MAX 1024
 static int g_gf_tab[GF_MAX];       // the files, open for reading and writing
 static int g_gf_n;                 // how many; 0 while the guest is anonymous. Set by mem_init_once, whose pthread_once orders it before every reader
@@ -83,7 +88,12 @@ static void *guest_file_thread(void *arg) {
     (void)arg; const double G = 1073741824.0;
     for (unsigned sec = 1;; sec++) {
         sleep(1);
-        struct statfs fs; struct rusage_info_v4 ru; task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT; struct stat st;
+#ifdef __ANDROID__
+        struct statfs fs; int ru; task_vm_info_data_t vi;
+#else
+        struct statfs fs; struct rusage_info_v4 ru; task_vm_info_data_t vi;
+#endif
+        mach_msg_type_number_t n = TASK_VM_INFO_COUNT; struct stat st;
         int fs_ok = !fstatfs(g_gf_tab[0], &fs); double avail = fs_ok ? (double)fs.f_bavail * fs.f_bsize / G : -1, held = 0;
         if (fs_ok && g_gf_min_free && (uint64_t)fs.f_bavail * fs.f_bsize < g_gf_min_free) {
             LOG("[RED] [mem] guest file: %.1f GB free on its disk, under %.1f: stopping the game (the free space statfs gives, f_bavail, which leaves out space the system could purge)", avail, g_gf_min_free / G);
@@ -91,11 +101,24 @@ static void *guest_file_thread(void *arg) {
         }
         if (sec % 10) continue;
         for (int i = 0; i < g_gf_n; i++) if (!fstat(g_gf_tab[i], &st)) held += st.st_blocks * 512.0;
+#ifdef __ANDROID__
+        // Linux has no rusage_info nor the footprint's parts: the process's disk reads and writes from /proc/self/io, its major faults (page-ins) from getrusage, its resident set from task_info
+        (void)ru;
+        unsigned long long rb = 0, wb = 0; int io_ok = 0;
+        { FILE *f = fopen("/proc/self/io", "r"); char l[128];
+          if (f) { while (fgets(l, sizeof l, f)) { io_ok |= sscanf(l, "read_bytes: %llu", &rb) == 1; io_ok |= (sscanf(l, "write_bytes: %llu", &wb) == 1) << 1; } fclose(f); } }
+        struct rusage gr; int gr_ok = !getrusage(RUSAGE_SELF, &gr);
+        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS) memset(&vi, 0, sizeof vi);
+        LOG("%s[mem] guest file: %.2f GB allocated on disk; process read %.2f GB from disk, %llu page-ins, wrote %.2f GB to disk; resident %.2f GB (peak so far %.2f); %.1f GB free on its disk",
+            avail >= 0 && avail < 2 ? "[RED] " : "", held / G, io_ok & 1 ? rb / G : -1, gr_ok ? (unsigned long long)gr.ru_majflt : 0ull, io_ok & 2 ? wb / G : -1,
+            vi.phys_footprint / G, vi.resident_size_peak / G, avail);
+#else
         int ru_ok = !proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru);
         if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) != KERN_SUCCESS) memset(&vi, 0, sizeof vi);
         LOG("%s[mem] guest file: %.2f GB allocated on disk; process read %.2f GB, %llu page-ins, logical writes %.2f GB; footprint %.2f GB (internal %.2f, compressed %.2f, peak so far %.2f), file pages mapped (external) %.2f GB; %.1f GB free on its disk",
             avail >= 0 && avail < 2 ? "[RED] " : "", held / G, ru_ok ? ru.ri_diskio_bytesread / G : -1, ru_ok ? (unsigned long long)ru.ri_pageins : 0ull,
             ru_ok ? ru.ri_logical_writes / G : -1, vi.phys_footprint / G, vi.internal / G, vi.compressed / G, ru_ok ? ru.ri_lifetime_max_phys_footprint / G : -1, vi.external / G, avail);
+#endif
     }
     return NULL;
 }
@@ -180,11 +203,21 @@ static void guest_file_init(void) {
     if ((g_reserve + chunk - 1) / chunk > GF_MAX) chunk = ((g_reserve + GF_MAX - 1) / GF_MAX + 0xfffff) & ~(size_t)0xfffff;
     int n = (int)((g_reserve + chunk - 1) / chunk); char dir[1024] = "", why[1400]; struct statfs fs;
     if (d && *d) snprintf(dir, sizeof dir, "%s", d);
+#ifdef __ANDROID__
+    else if (getenv("TMPDIR") && *getenv("TMPDIR")) snprintf(dir, sizeof dir, "%s", getenv("TMPDIR"));   // Android has no per-user temporary folder to ask for: the app's cache (front_android.c)
+    else { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: no temporary folder: set DM_GUEST_FILE_DIR or TMPDIR)"); return; }
+#else
     else if (!confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof dir)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: no temporary folder, errno %d)", errno); return; }
+#endif
     if (!guest_files_map(dir, chunk, n, &fs, why, sizeof why)) { LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE: %s)", why); return; }
     g_gf_n = n;
+#ifdef __ANDROID__
+    LOG("[mem] guest memory: %d files of %.2f GB in %s (unlinked, sparse, shared), %.2f GB in all, on a volume of type %#lx, %.1f GB free on it", n, chunk / G, dir, g_reserve / G, (unsigned long)fs.f_type, (double)fs.f_bavail * fs.f_bsize / G);
+    if (fs.f_type != 0xF2F52010 && fs.f_type != 0xEF53) LOG("[RED] [mem] guest file: not on f2fs or ext4 (the data partition's file systems), where it may not be sparse, or be slow");
+#else
     LOG("[mem] guest memory: %d files of %.2f GB in %s (unlinked, sparse, shared), %.2f GB in all, on the %s volume, %.1f GB free on it", n, chunk / G, dir, g_reserve / G, fs.f_fstypename, (double)fs.f_bavail * fs.f_bsize / G);
     if (strcmp(fs.f_fstypename, "apfs") || !(fs.f_flags & MNT_LOCAL)) LOG("[RED] [mem] guest file: not on a local APFS volume, where it may not be sparse, or be slow");
+#endif
     pthread_t th; int rc = pthread_create(&th, NULL, guest_file_thread, NULL);
     if (!rc) pthread_detach(th);
     else LOG("[RED] [mem] guest file: no thread to watch it (error %d): no 10-s line, and nothing stops the game when its disk fills", rc);

@@ -17,6 +17,10 @@ def convert(text):
         code = re.sub(r'\b(\w+)@PAGE\b', r'\1', code)
         code = code.replace('.private_extern', '.hidden')
         code = re.sub(r'^(\s*)\.cstring\b', r'\1.section .rodata.str1.1,"aMS",@progbits,1', code)
+        # .zerofill __DATA,__bss,sym,size,align (align as a power of two): a zeroed symbol in .bss of its own, with that alignment (entry.S dm_gate_top is page-aligned so
+        # that each gate stub reaches its entry with adrp and an immediate offset alone), then back to the section that was current
+        code = re.sub(r'^(\s*)\.zerofill\s+__DATA\s*,\s*__bss\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\d+)\s*$',
+                      lambda m: f'{m.group(1)}.pushsection .bss.{m.group(2)},"aw",@nobits; .p2align {m.group(4)}; {m.group(2)}: .zero {m.group(3)}; .popsection', code)
         out.append(code + sep + comment)
         g = re.match(r'\s*\.globl\s+(\w+)', code)
         if g: out.append(f'    .hidden {g.group(1)}')

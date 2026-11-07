@@ -5,30 +5,48 @@
 // configuration for AV1, so the sequence header comes from the stream, where every key frame carries one (AV1 5.5); a changed one makes a new session. A temporal unit goes in whole, its OBUs in
 // the low-overhead format WebM and the SDK's demuxer keep them in (each with its size). Decoding is synchronous and a temporal unit shows at most one frame, in presentation order, so no queue
 #include "hle.h"
+// DM_AV1_VT: the VideoToolbox backend, on Apple platforms only. Elsewhere (Android) dav1d decodes every stream: hw_av1 answers 0, so mav1_new and mav1_reset choose it
+#ifdef __APPLE__
+#define DM_AV1_VT 1
 #include <VideoToolbox/VideoToolbox.h>
+#else
+#define DM_AV1_VT 0
+#endif
 #include "dav1d/dav1d.h"
 #include "hle_movie_av1.h"
 
 struct mav1 {
     uint8_t seq[512]; size_t nseq;
+#if DM_AV1_VT
     CMVideoFormatDescriptionRef fd; VTDecompressionSessionRef vs;
     CVPixelBufferRef got, locked;
+#endif
     int soft;                     // dav1d decodes: no hardware decoder, DM_AV1_DAV1D=1, or a stream VideoToolbox refused (until mav1_reset)
     Dav1dContext *dav1d; Dav1dPicture pic; int has_pic;
     uint8_t *y8, *uv; size_t ny8, nuv;   // dav1d's picture as NV12: the chroma interleaved, and the luma of a 10- or 12-bit stream shifted to 8 bits
     int red;
 };
+#if DM_AV1_VT
 static int hw_av1(void) { const char *e = getenv("DM_AV1_DAV1D"); return !(e && *e && *e != '0') && VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1); }
+#else
+static int hw_av1(void) { return 0; }
+#endif
 mav1 *mav1_new(void) { mav1 *a = calloc(1, sizeof *a); if (!a) die("movie: AV1 decoder allocation failed"); a->soft = !hw_av1(); return a; }
 const char *mav1_backend(const mav1 *a) { return a->soft ? "dav1d" : "VideoToolbox"; }
 static void unlock_picture(mav1 *a) {
+#if DM_AV1_VT
     if (a->locked) { CVPixelBufferUnlockBaseAddress(a->locked, kCVPixelBufferLock_ReadOnly); CVPixelBufferRelease(a->locked); a->locked = NULL; }
+#endif
     if (a->has_pic) { dav1d_picture_unref(&a->pic); a->has_pic = 0; }
 }
 static void av1_close(mav1 *a) {
+#if DM_AV1_VT
     if (a->vs) { VTDecompressionSessionWaitForAsynchronousFrames(a->vs); VTDecompressionSessionInvalidate(a->vs); CFRelease(a->vs); a->vs = NULL; }
     if (a->fd) { CFRelease(a->fd); a->fd = NULL; }
     if (a->got) { CVPixelBufferRelease(a->got); a->got = NULL; }
+#else
+    (void)a;
+#endif
 }
 void mav1_reset(mav1 *a) { unlock_picture(a); av1_close(a); a->nseq = 0; if (a->dav1d) dav1d_flush(a->dav1d); a->soft = !hw_av1(); }
 void mav1_free(mav1 *a) { if (a) { mav1_reset(a); if (a->dav1d) dav1d_close(&a->dav1d); free(a->y8); free(a->uv); free(a); } }
@@ -101,6 +119,7 @@ int mav1_av1c(const uint8_t *obu, size_t n, uint8_t c[4], int *w, int *h) {
     return 1;
 }
 // The sequence header OBU of a temporal unit, or none
+#if DM_AV1_VT
 static const uint8_t *find_seq(const uint8_t *p, size_t n, size_t *len) {
     for (size_t i = 0; i < n;) {
         if (!(p[i] & 2)) return NULL;   // no size field: not the low-overhead format
@@ -142,6 +161,7 @@ static int av1_open(mav1 *a, const uint8_t *seq, size_t n) {
     return 1;
 }
 // ---- dav1d ----
+#endif
 static void d_log(void *cookie, const char *fmt, va_list ap) {
     (void)cookie; char b[256]; vsnprintf(b, sizeof b, fmt, ap);
     size_t l = strlen(b); if (l && b[l - 1] == '\n') b[l - 1] = 0;
@@ -202,6 +222,7 @@ static int decode_dav1d(mav1 *a, const uint8_t *data, size_t n, mav1_picture *ou
 int mav1_decode(mav1 *a, const uint8_t *data, size_t n, mav1_picture *out) {
     unlock_picture(a);
     if (a->soft) return decode_dav1d(a, data, n, out);
+#if DM_AV1_VT
     size_t seqn = 0; const uint8_t *seq = find_seq(data, n, &seqn);
     if (seq && (seqn != a->nseq || memcmp(seq, a->seq, seqn) || !a->vs) && !av1_open(a, seq, seqn)) {   // a stream VideoToolbox does not take: dav1d from this temporal unit on (it holds the sequence header)
         LOG("[movie] AV1: dav1d decodes the stream instead"); av1_close(a); a->soft = 1;
@@ -225,4 +246,7 @@ int mav1_decode(mav1 *a, const uint8_t *data, size_t n, mav1_picture *out) {
                           !m || CFEqual(m, kCVImageBufferYCbCrMatrix_ITU_R_709_2) ? 2 : CFEqual(m, kCVImageBufferYCbCrMatrix_ITU_R_2020) ? 5 : 1, 0};
     if (m) CFRelease(m);
     return 1;
+#else
+    return decode_dav1d(a, data, n, out);   // not reached: soft is always set without VideoToolbox
+#endif
 }
