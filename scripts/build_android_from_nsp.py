@@ -608,7 +608,7 @@ def main(argv):
         bi.PROG.plan(5 + 2 * bool(sv) + len(set(sv) - {pkg_ver}) + bool(fam['dlc']) + (not a.no_push))   # an extraction per other shader version, and the DLC's
         bi.PROG.stage('build nx_extract'); nx = build_nx_extract(work, logs, env); bi.PROG.end()
         b, u = picks[pkg_ver]
-        game = bi.extract(nx, keys, ex, pkg_ver, b, u, None, logs, g)
+        game = bi.extract(nx, keys, ex, pkg_ver, b, u, None, logs, g, app)   # app: the application scan_nsps chose (nx_extract --app)
         bad = bi.build_mismatch(game, pkg_ver, g)
         if bad: say(f'[RED] not the builds game profile {g.id} registers ({"; ".join(bad)}): the per-build fixes of the profile do not reach these modules, the game may not boot')
         g = bi.rewrite(sys.executable, REPO, game / 'ExeFS', patched, env, logs, g)
@@ -617,7 +617,7 @@ def main(argv):
         aoc = bi.extract_aoc(nx, keys, REPO, work, app, fam, logs)
         if prov and serial: pull_captures(serial, g.id, capture_dir, logs)
         dlc_roms = sorted(p for p in aoc.iterdir() if p.is_dir() or p.suffix == '.img') if aoc else []
-        spv = build_shaders(sv, {v: (game if v == pkg_ver else bi.extract(nx, keys, ex, v, picks[v][0], picks[v][1], None, logs, g)) for v in sv}, work, logs, env, g, dlc_roms)
+        spv = build_shaders(sv, {v: (game if v == pkg_ver else bi.extract(nx, keys, ex, v, picks[v][0], picks[v][1], None, logs, g, app)) for v in sv}, work, logs, env, g, dlc_roms)
         bi.PROG.stage('Android host'); so, loader, ndk = build_host(sdk, g.id, work, logs, env); st = build_selftest(ndk, work, logs, env)
         library_add(g.id, so, loader, st, {'title_id': g.id, 'name': nacp.name(game / 'control.nacp') or g.get('name', ''), 'version': pkg_ver,
                                             'display': nacp.version(game / 'control.nacp'), 'nsp_dir': str(nsp_dir)})

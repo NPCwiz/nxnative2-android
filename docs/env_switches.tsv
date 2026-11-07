@@ -20,6 +20,7 @@ DM_CHEATS_ANY_BUILD	switch	`1` loads a cheat file written for another build of t
 DM_CHEATS_DEBUG	diagnostic	Logs every memory write a cheat makes and the cheat file context the menu's "another version" rows come from
 DM_CHEATS_ON	switch	Comma-separated cheat names turned on at launch, besides the saved per-build enabled states
 DM_CHEATS_WINDOW	switch	`1` opens the Mac Cheats panel beside the game from the start
+DM_COMMIT	path	Android: the commit the start-up line `build: commit …` names (an app bundle's `DMCommit` on Apple platforms); unset, `not recorded`
 DM_COPY_GAME_RESOURCES	switch	`NO` skips the Xcode build phase that copies the game's resources into the app (`stage_resources.sh`, on by default); `build_ipa.sh` sets it for its unsigned build, which packs them itself
 DM_COPY_ROMFS	switch	`NO` keeps the game files out of the app, in the Xcode build phase (`stage_resources.sh`) and in the unsigned IPA of `build_ipa.sh` (on by default): `main.m` takes the validated `Documents/romfs.img` copied by `scripts/push_romfs.sh`, then a `Documents/romfs` folder; the build writes the image's identity as `romfs.id` into the app, and `main.m` uses only a matching image (`--romfs separate` of the NSP script sets this)
 DM_CTL	diagnostic	`=<file>` (Mac): the host polls the file every 100 ms and runs each appended line: button presses, `shot`, `passdump`, `texdump`, `env KEY=VALUE`, `peek`, `memdump`, `drag` and more
@@ -40,6 +41,7 @@ DM_FD_LOG	diagnostic	`=<seconds>` logs, every that many seconds, the number and 
 DM_FIXED_TIME	switch	`=<seconds>`: the user clock always returns that time and the host time zone is pinned to UTC, for deterministic comparison
 DM_FOCUS_KEEP	switch	`1` keeps the game in focus while its Mac window is up, whichever app is active (minimizing still counts); `scripts/regress.py` sets it, so another app taking the key window during a run does not pause a game that stops out of focus
 DM_FONT_DIR	path	Folder of the shared-font stand-ins (`standard.ttf`, `nintendo_ext.ttf` with the button icons); the app, the Mac launcher and the NSP script set it
+DM_FORCE_SELFTEST	test	Android: `1` runs the host's built-in self test instead of its game; `loader.c` sets it for the launcher's self test
 DM_FORCE_STRICT	diagnostic	`=1` makes the loader fail on forced-hook entries no module references, instead of only noting them (for checking a mistyped list)
 DM_FPS	switch	`30` or `60` pins the frame rate the display link and frame pacing aim for; otherwise it follows the game's present interval (60, or 30 when the game asks for 30)
 DM_FPS_HOLD	player	`on` / `off` overrides the profile's `fps_hold`: whether late frames may raise the hold above the frame cap's vsyncs (on by default)
@@ -369,6 +371,7 @@ DM_UPSCALER	player	`metalfx` draws the game's own upscaler shaders (agl's NDSR n
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
 DM_VK_DEBUG	diagnostic	Android: logs every shader and pipeline the Vulkan replay makes (`gfx_vk_draw.inc`)
 DM_VK_DUMP	diagnostic	Android: `=<frame>` dumps every pass's colour targets of that frame to `DM_DUMP_DIR` with a per-draw log (`files/dump_now` asks for the next frame)
+DM_VK_GEOCACHE	switch	Android: `0` turns off keeping geometry on the GPU between frames (`gfx_vk_draw.inc` gc_on); on by default, off in the Vulkan safe mode
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
 DM_VK_PREWARM	switch	Android: how many pipelines of the list the replay makes again at start (default 3000; `0` none)
 DM_VK_SAFE	diagnostic	Android: `1` turns off the replay's GPU forwarding, early submissions and window fences (every sync waits), to tell a sync bug from a drawing one
