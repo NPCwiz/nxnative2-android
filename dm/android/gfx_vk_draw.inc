@@ -480,6 +480,12 @@ static int draw_state_is(uint32_t op) {
     }
 }
 // state records (nvn_mtl.m state_op): 1 when the op was one
+static void prog_forget_bound(const prog_t *p) {
+    int n = 0;
+    for (int st = 0; st < 5; st++) if (D.bst[st] == p) D.bst[st] = NULL, n++;
+    if (D.cprog == p) D.cprog = NULL, n++;
+    if (n) { static unsigned k; if (!k++ || !(k & (k - 1))) LOG("[vk] finalized program %p dropped from the bound state (%u times so far)", (const void *)p, k); }
+}
 static int draw_state_op(uint32_t op, const void *a) {
     if (!g_d_init) draw_state_reset();   // NVN's defaults, once (the state carries over between submissions, as in nvn_mtl.m)
     switch (op) {

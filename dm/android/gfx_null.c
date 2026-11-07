@@ -136,6 +136,8 @@ int mtl_tex_gpu_owned(uint64_t serial) { (void)serial; return 0; }
 void mtl_reg_tex(int id, const tex_t *t, const view_t *v) { (void)id; (void)t; (void)v; }
 void mtl_reg_samp(int id, const samp_par *p) { (void)id; (void)p; }
 void mtl_prog_release(prog_t *p) { (void)p; }
+void mtl_prog_forget(const prog_t *p) { (void)p; }   // no bound state
+#include "gfx_iface_upstream.inc"
 // A CPU read of a texture: with no GPU content, the bytes read are zero
 void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     (void)t; (void)level; (void)layer0;

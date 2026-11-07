@@ -12,6 +12,7 @@
 #include <media/NdkImageReader.h>
 #include "dm.h"
 #include "hle_movie_avc.h"
+#include <stdatomic.h>
 
 // ---------------- H.264 ----------------
 #define QMAX 16
@@ -21,7 +22,11 @@ struct mavc {
     AMediaCodec *mc; AImageReader *rd; ANativeWindow *win; int eos;
     pthread_mutex_t mu; pthread_cond_t cv; pic_t q[QMAX]; int nq, w, h; long rendered, arrived;   // pictures sent to the reader / taken from it
     uint8_t *au; size_t aucap;
+    _Atomic int32_t cstd;   // the output format's colour standard (MediaFormat KEY_COLOR_STANDARD, from the stream's VUI): 1 BT.709, 2 / 4 BT.601, 6 BT.2020; 0 not reported
 };
+// The stream's colour matrix is BT.709 (hle_movie.c, the YUV-to-RGB conversion): as the decoder reports it from the stream; unreported (or no output yet), from 720 lines up,
+// as hle_movie_avc.c decides when VideoToolbox's format description carries no matrix
+int mavc_bt709(const mavc *a, int h) { int32_t c = atomic_load(&((mavc *)a)->cstd); return c ? c == 1 : h >= 720; }
 mavc *mavc_new(void) {
     mavc *a = calloc(1, sizeof *a); if (!a) die("movie: AVC decoder allocation failed");
     pthread_mutex_init(&a->mu, NULL); pthread_cond_init(&a->cv, NULL);
@@ -30,7 +35,7 @@ mavc *mavc_new(void) {
 static void close_codec(mavc *a) {
     if (a->mc) { AMediaCodec_stop(a->mc); AMediaCodec_delete(a->mc); a->mc = NULL; }
     if (a->rd) { AImageReader_delete(a->rd); a->rd = NULL; a->win = NULL; }   // the window belongs to the reader
-    a->eos = 0;
+    a->eos = 0; atomic_store(&a->cstd, 0);
 }
 void mavc_drop(mavc *a) {
     pthread_mutex_lock(&a->mu); for (int i = 0; i < a->nq; i++) free(a->q[i].buf); a->nq = 0; pthread_mutex_unlock(&a->mu);
@@ -127,7 +132,12 @@ static int drain(mavc *a, int64_t timeout_us) {
             pthread_mutex_lock(&a->mu);
             for (int k = 0; k < 20 && a->arrived < a->rendered; k++) { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 5000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; } pthread_cond_timedwait(&a->cv, &a->mu, &ts); }
             pthread_mutex_unlock(&a->mu); if (bi.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) return 1; continue; }
-        if (i == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED || i == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
+        if (i == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+            AMediaFormat *f = AMediaCodec_getOutputFormat(a->mc); int32_t c = 0;
+            if (f) { if (AMediaFormat_getInt32(f, "color-standard", &c) && c > 0) atomic_store(&a->cstd, c); AMediaFormat_delete(f); }   // AMEDIAFORMAT_KEY_COLOR_STANDARD (API 28)
+            continue;
+        }
+        if (i == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) continue;
         return 0;   // try again later
     }
 }
